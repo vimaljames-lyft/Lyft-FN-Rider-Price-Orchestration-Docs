@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Rider Pricing Unification — Technical Spec (Phase 2)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<style>
+  :root {
+    --pink: #cf0090; --plum: #820076; --cherry: #1d0c17; --ink: #31222a;
+    --g100: #e7e5e5; --g300: #b9b2b4;
+  }
+  body { font-family: 'Inter', -apple-system, sans-serif; color: var(--cherry);
+    max-width: 880px; margin: 0 auto; padding: 48px 32px; line-height: 1.6; }
+  h1, h2, h3, h4 { font-family: 'Inter Tight', sans-serif; line-height: 1.25; }
+  h1 { font-size: 20pt; color: var(--pink); margin-top: 0; }
+  h2 { font-size: 16pt; color: var(--cherry); border-bottom: 2px solid var(--g100);
+    padding-bottom: 6px; margin-top: 2.2em; }
+  h3 { font-size: 14pt; color: var(--plum); }
+  h4 { font-size: 11pt; color: var(--ink); }
+  code { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 0.86em;
+    background: var(--g100); padding: 1px 5px; border-radius: 4px; }
+  pre { background: #faf7f9; border: 1px solid var(--g300); border-radius: 8px;
+    padding: 14px 16px; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 0.94em; }
+  th, td { border: 1px solid var(--g300); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--g100); font-family: 'Inter Tight', sans-serif; font-weight: 600; }
+  blockquote { border-left: 3px solid var(--pink); margin: 1em 0; padding: 4px 16px;
+    background: #faf7f9; color: var(--ink); }
+  a { color: var(--pink); }
+  hr { border: none; border-top: 1px solid var(--g100); margin: 2em 0; }
+  .mermaid { margin: 1.5em 0; text-align: center; }
+</style>
+</head>
+<body>
+<h1 id="rider-pricing-unification-predefined-fares-surcharges-phase-2">Rider Pricing Unification — Predefined Fares &amp; Surcharges (Phase 2)</h1>
+<p><strong>Part of:</strong> <a href="rider-pricing-unification-phase2-tech-spec.html">Full Base-Price Orchestration (Phase 2)</a> — shared architecture, endpoint &amp; graphs, cardinality, connectivity, rollout live on the hub page. <strong>Siblings:</strong> <a href="rider-pricing-unification-phase2-metered.html">Metered fares</a> · <a href="rider-pricing-unification-phase2-upfront.html">Upfront fares</a> <strong>Adoption order:</strong> steps 1–2 (predefined amount, then surcharges) — the fetch/fuse workstream, adopted first.</p>
+<hr/>
+<h2 id="component-predefined-fares">Component: predefined fares</h2>
+<p>Predefined has no calculation: PC owns fetch and select, and (once surcharges are relayed) the surcharge-fused build. Scope is <strong>fetching only</strong>: PC reaches predefined fares by <strong>calling back to FreeNow&#x27;s <code>PredefinedFareService</code> over egress</strong> — the service is *not* migrated into Lyft infra (decided 2026-08-24; migration ruled out as excessive scope). Lyft has no predefined-fare concept, so predefined fields are FreeNow-native and travel as metadata.</p>
+<p><strong>Request</strong> (built by TFC enrichment, <code>FareCalculationRequest.toPredefinedFareBulkRequest</code>):</p>
+<pre><code>pickup: List&lt;Long&gt;        // polygon ids
+dropOff: List&lt;Long&gt;       // polygon ids
+dateTime: OffsetDateTime
+fleetTypes: List&lt;FleetType&gt;   // FleetType { fleetTypeId: String, bookingOptions: String }
+businessAccountIds: List&lt;Long&gt;
+bookingOfferType: String
+officeId: Long
+isMultiStopTour: Boolean  // multi-stop tours receive only non-minimum predefined fares</code></pre>
+<p><strong>Response</strong> — <code>PredefinedFareBulkResponse</code>, keyed by fleet type (<code>predefinedfareservice</code> <code>PredefinedFareV2Response.kt</code>):</p>
+<pre><code>byFleetType: Map&lt;String, List&lt;PredefinedFareResponseV2&gt;&gt;
+
+PredefinedFareResponseV2 {
+  uuid: UUID
+  fareType: FIXED | MINIMUM | MAXIMUM
+  amountInLong: Long
+  currency: String
+  businessAccountId: Long?
+  commissionPercentage: Double?
+  priceModelHighlightTranslationKey: String?
+}</code></pre>
+<p>Build fuses surcharge into the total (<code>PredefinedFareBulkSelector</code>: <code>totalAmount = base + surcharge</code>). PC can own the full predefined path only once surcharges are relayed through PC (see <a href="#component-surcharges">Component: surcharges</a>); until then PC owns fetch + select and TFC does the surcharge-coupled build.</p>
+<p><strong>Insertion point:</strong> a gated parallel branch in <code>FareCalculatorService.calculateFares</code>, alongside the existing <code>predefinedFareBulkAsync</code> fetch. TFC maps the returned line items to <code>PredefinedFareCalculationResult</code> with no change to the served quote until the field is at parity.</p>
+<h3 id="business-account-b2b-handling">Business-account (B2B) handling</h3>
+<p>For a B2B account the predefined fare *value* can genuinely differ — not a discount layered on top (as NA&#x27;s <code>EnterpriseUpfrontDiscountNode</code> does) — so PC cannot copy a Standard result and re-label it. Grounded in the current TFC/predefinedfareservice code:</p>
+<ul><li>TFC&#x27;s <strong>enrichment step</strong> (<code>FareCalculationRequestEnricherService</code>, runs before calculation) resolves the rider&#x27;s payment methods from <code>PaymentGatewayService</code> and extracts <code>businessAccountIds</code> from them (each payment method carries a <code>businessAccountId</code>) — so the ids are already resolved TFC-side today.</li><li>Those <code>businessAccountIds</code> are already sent in the predefined bulk request (<code>toPredefinedFareBulkRequest</code>), and <code>predefinedfareservice</code> returns <strong>genuinely different B2B amounts</strong> as distinct fare rows when configured (<code>FixedFareRepository</code> query keyed on <code>businessAccountId</code>).</li><li><strong>Proposed EU flow:</strong> TFC passes the already-resolved <code>businessAccountIds</code> to PC → PC forwards them to <code>PredefinedFareService</code> (whose contract already accepts them). This keeps payment/B2B resolution in TFC (consistent with the payment-stays-in-TFC decision) and makes PC a pass-through — preferable to having PC re-resolve B2B from <code>passengerId</code>.</li><li><strong>Fallback to replicate:</strong> when no B2B fare is configured, TFC today falls back to the B2C fare and merely relabels it (stamps <code>businessAccountId</code>, resets <code>quoteId</code>, strips discounts/credits). PC (or TFC) must preserve this <code>b2bFare ?: defaultFare</code> fallback.</li></ul>
+<p>Open point: confirm this passthrough is the agreed contract vs the PR #3033 &quot;pass raw <code>passengerId</code>, resolve internally&quot; phrasing; see <a href="rider-pricing-unification-phase2-tech-spec.html#open-questions">Open questions</a>.</p>
+<hr/>
+<h2 id="component-surcharges">Component: surcharges</h2>
+<p>FreeNow and Lyft model surcharges as structural opposites. FreeNow&#x27;s <code>quotesurchargeservice</code> (QSS) is a <strong>single catalog</strong>: every fee — city, toll, airport, clean-air, prebook, holiday, high-demand, booking, ETA-based — is one <code>SurchargeConfiguration</code> discriminated by <code>businessType</code> (13 values) and <code>category</code> (<code>PLATFORM_FEE</code> / <code>DRIVER_FEE</code> / <code>UNCATEGORIZED</code>), with a generic three-part amount (fixed + percentage-of-base + elastic/surge). PriceComposer has <strong>no such catalog</strong>: each fee is its own graph node with its own upstream client and its own typed line item (<code>TollAutomated</code>, <code>VenueFee</code>, <code>TrustAndSafety</code>, <code>LyftEventSurcharge</code>, …). There is no generic surcharge type to receive FreeNow&#x27;s business types, and most FreeNow surcharges have no Lyft equivalent.</p>
+<p>The relay maps the few that map cleanly and passes the rest through as metadata, keeping Lyft&#x27;s domain agnostic of FreeNow. Lyft&#x27;s core pricing domain — the shared line-item enum and graph types — learns nothing about FreeNow: all FreeNow knowledge is confined to (a) the FreeNow relay node inside PC and (b) the PC↔TFC wire contract.</p>
+<p><strong>Mapping (allowlist — default is metadata):</strong></p>
+<table>
+<thead><tr>
+<th>FreeNow <code>businessType</code></th>
+<th>Lyft line item</th>
+</tr></thead><tbody>
+<tr><td><code>TOLL</code></td><td><code>TollAutomated</code></td></tr>
+<tr><td><code>AIRPORT_FEE</code></td><td><code>VenueFee</code> (airport)</td></tr>
+<tr><td><code>HIGH_DEMAND_FEE</code></td><td>metadata only — overlaps PrimeTime; mapping would double-count surge</td></tr>
+<tr><td>all others</td><td>metadata</td></tr>
+</tbody></table>
+<p><strong>How TFC calls it (grounded).</strong> TFC&#x27;s quote calc calls QSS <strong>once, in bulk</strong>: <code>POST /api/v1/surcharges/select</code> (<code>QuoteSurchargeService.selectQuoteSurcharges</code>), passing a <code>selectionOptions</code> list that covers every <code>fleetTypeId × paymentMethod</code> in the quote. QSS has <strong>no <code>/bulk</code> endpoint</strong>, and TFC does <strong>not</strong> call <code>/apply</code> — the percentage-of-base is applied later, TFC-side (see Build). The relay mirrors this exact <code>/select</code> call.</p>
+<p><strong>Request</strong> (<code>SurchargeSelectionRequestDto</code>):</p>
+<pre><code>pickup / dropOff - Location { polygonIds: [Long], officeId: Long?, countryCode: String, geoCoordinates: { latitude, longitude: Double } }
+dateTime         - OffsetDateTime
+routeId          - String
+bookingOfferType - String (ACTUAL | ADVANCE)
+passengerId      - Long?
+selectionOptions - [ { fleetTypeId: String, paymentMethod: { id: Long, type: String, businessAccountId: Long? }, eta: Long } ]</code></pre>
+<p>No base fare — <code>/select</code> is a selection, not a computation.</p>
+<p><strong>Response → data shape.</strong> <code>/select</code> returns <code>items</code>, one per <code>selectionOption</code>, each with a list of surcharges; TFC groups by <code>fleetTypeId</code> and merges surcharges across payment methods (<code>SurchargeMapper.toBo</code> → <code>SurchargesByFleetType = Map&lt;fleetTypeId, List&lt;SurchargeBo&gt;&gt;</code>). Each surcharge is FreeNow-faithful, plus a nullable Lyft-mapping annotation set only when mappable:</p>
+<pre><code>SurchargeEntry {
+  // FreeNow-faithful (from QSS /select)
+  configId, businessType, category, currency, description, translationKey,
+  fixedAmount:      { valueInMinor: Int, elastic: Bool, experiments[] },
+  percentageAmount: { value: rate, maxValueInMinor: ceiling } | null,
+  binConfiguration: { minValueInMinor, maxValueInMinor } | null,   // fare boundary
+  selectionOption:  { fleetTypeId, paymentMethod }
+  // set only for TOLL / AIRPORT_FEE, null otherwise
+  lyftMapping: { type, subType } | null
+}</code></pre>
+<p>TFC reads the FreeNow fields to rebuild <code>SurchargeBo</code> / <code>FareSurchargeInfo</code> (unchanged behaviour, shadow-safe). PC reads <code>lyftMapping</code>: non-null → materialize a native <code>TollAutomated</code> / <code>VenueFee</code> for its full-quote representation; null → the entry stays metadata and never becomes a Lyft domain object.</p>
+<p><strong>Relay</strong> (same five-layer template as the PrimeTime relay — see <a href="rider-pricing-unification-phase2-tech-spec.html#proxying-to-freenow-the-relay-template">the relay template</a>): IDL <code>freenow_surcharges.proto</code> (bulk <code>/select</code> shape) → PC ingredient node calling QSS <code>/select</code> over egress → PC relay node applying the mapping table → PC → FreeNow egress + auth → TFC read behind a <code>SurchargeProvider</code> seam, gated per office/fleet, fallback to the direct QSS <code>/select</code> call, in shadow.</p>
+<p><strong>Build / fusion (TFC-side).</strong> The percentage-of-base and the final sum are computed <strong>in TFC</strong>, not QSS: <code>FareSurchargeCalculator.calculateSurcharges(baseAmountInMinor)</code> does, per surcharge, <code>amount = round( min( base × percentage/100 + fixedAmount, ceiling ) )</code> (fixed-only when <code>percentage = 0</code>), summing to <code>FareSurchargeInfo.fareSurchargeAmountInMinor</code>. Because this needs the base fare — which isn&#x27;t in PC during the surcharge-first slice — <strong>fusion stays in TFC</strong>; the relay moves only the *selection*. Once base pricing also lives in PC, the fusion step can follow. TFC remains the source of truth for representation and breakdown throughout.</p>
+<h2 id="proposed-flow">Proposed Flow</h2>
+<div class="mermaid">
+
+sequenceDiagram
+    participant R as Rider / upstream
+    participant TFC as TFC (FareCalculatorService)
+    participant PC as PriceComposer (pricecomposereurope)
+    participant PFS as PredefinedFareService (FN)
+    participant QSS as QuoteSurchargeService (FN)
+
+    R->>TFC: quote request (pickup, dropoff, fleetTypes[Taxi, PHV], riderId)
+
+    Note over TFC: Enrich (TFC-side, unchanged): PolygonService → pickup/dropoff polygonIds,<br/>resolve officeId + countryCode + coords, dateTime, bookingOfferType
+
+    TFC->>PC: GetForPassengerEurope — ONE call<br/>trip context + quote_key_infos[Taxi, PHV]<br/>passengerId (raw), includePaymentMethodFares = false<br/>[gated per office/fleet]
+
+    loop per fleet type → one QuoteKey → one graph execution
+        Note over PC: fleetType → QuoteKey = (RideType, PricingKey)<br/>via naive EU mapping (closed enum). OfferKey = fleetTypeId
+        PC->>PFS: predefined bulk fetch<br/>(polygonIds, officeId, fleetTypeId, passengerId→B2B, bookingOfferType, dateTime)
+        PFS-->>PC: PredefinedFareResponseV2 (FIXED, amountInLong, currency)
+        PC->>QSS: POST /api/v1/surcharges/select<br/>selectionOptions[fleetTypeId × paymentMethod], locations, routeId, dateTime
+        QSS-->>PC: surcharges (fixedAmount + percentage rate + ceiling, per option)
+        Note over PC: Build: total = base + fused surcharge<br/>(base × pct/100 + fixed, capped at ceiling, rounded)<br/>map TOLL→TollAutomated, AIRPORT_FEE→VenueFee, else metadata<br/>emit line_items[]
+    end
+
+    PC-->>TFC: QuoteKeyPriceResult[] — one per QuoteKey<br/>each { offer_key = fleetTypeId, line_items[], price_group_id (shared) }
+
+    Note over TFC: Match results by offer_key → fleetType<br/>payment-method fan-out (mapFareCalculationResultToPaymentMethods)<br/>B2B resolved via passengerId, build PredefinedFareCalculationResult<br/>persist + represent (FareFormatService / PriceBreakdownService)
+
+    TFC-->>R: quotes (fleetType × paymentMethod × businessAccount), each own quoteId
+
+</div>
+<hr/>
+<h2 id="proposed-implementation-steps-in-order">Proposed Implementation Steps In order</h2>
+<p>Migration steps. At the end, predefined fares (with fused surcharges and B2B) are produced by PriceComposer and served to riders through it, under shadow then cut over. *(Proposal — not yet created in Jira.)*</p>
+<blockquote>The table is <strong>dependency order, not a strict sequence</strong> — steps with the same prerequisites run in parallel (e.g. Step 3 and Step 4b both need only Step 2). <strong>Step 4a is the long pole:</strong> a cross-org ask with no dependencies that gates Step 5 — start it on day one, don&#x27;t wait for its number to come up.</blockquote>
+<table>
+<thead><tr>
+<th>#</th>
+<th>Step</th>
+<th>Depends on</th>
+</tr></thead><tbody>
+<tr><td>1</td><td>Networking &amp; egress: PC → <code>PredefinedFareService</code> + QSS (reuse PT egress + Vault RBAC token)</td><td>—</td></tr>
+<tr><td>2</td><td>IDL contract: europe endpoint request/response covering predefined + surcharge fields</td><td>—</td></tr>
+<tr><td>3</td><td>Surcharge relay: PC node calls QSS <code>/select</code>; apply mapping (TOLL→TollAutomated, AIRPORT_FEE→VenueFee, else metadata)</td><td>1, 2</td></tr>
+<tr><td>4a</td><td>Obtain FreeNow&#x27;s enumerated <code>fleetType</code> value list (Vimal/Lucas) — cross-org input for the mapping; <strong>start day one</strong></td><td>—</td></tr>
+<tr><td>4b</td><td>Add <code>fleetType → (RideType, PricingKey)</code> naive EU mapping (closed-enum entries in <code>idlcode-go</code>); <code>OfferKey = fleetTypeId</code></td><td>2, 4a</td></tr>
+<tr><td>5</td><td>Predefined relay: PC node calls <code>PredefinedFareService</code> (fetch + select); pass <code>businessAccountIds</code> for B2B, <code>b2bFare ?: default</code> fallback</td><td>1, 2, 4b</td></tr>
+<tr><td>6</td><td>PC build: fuse surcharge into predefined total; emit <code>QuoteKeyPriceResult.line_items[]</code> per QuoteKey</td><td>3, 5</td></tr>
+<tr><td>7</td><td>TFC read side: provider seam, gated per office/fleet, map to <code>PredefinedFareCalculationResult</code>, fallback to direct calls</td><td>6</td></tr>
+<tr><td>8</td><td>Shadow + drift alarming (reuse <code>QuoteCalculationComparisonService</code> / <code>prc-tfc-*</code>)</td><td>7</td></tr>
+<tr><td>9</td><td>Rollout &amp; cut over per office/fleet at parity → predefined served through PC</td><td>8</td></tr>
+</tbody></table>
+<p><strong>Done when:</strong> TFC reads the predefined total from PC on the gated path, at parity with native, in the rollout markets.</p>
+<hr/>
+<h2 id="step-details">Step details</h2>
+<p>The higher-level intent behind each step. Diagrams appear only where they read easier than prose.</p>
+<h3 id="1-networking-egress">1. Networking &amp; egress</h3>
+<p>PC must be reachable from TFC, and each FreeNow source must be reachable from PC — two directional private links with roles reversed, reusing the Phase-1 PrimeTime path and Vault RBAC token.</p>
+<div class="mermaid">
+flowchart LR
+  TFC["TFC (FreeNow)"] -->|"call"| PC["PriceComposer (Lyft)"]
+  PC -->|"egress"| PFS["PredefinedFareService (FreeNow)"]
+  PC -->|"egress"| QSS["QuoteSurchargeService (FreeNow)"]
+</div>
+<h3 id="2-idl-contract">2. IDL contract</h3>
+<p>Define one europe endpoint request/response that can carry the predefined amount plus surcharge fields. This is the shared wire shape both sides build against; every later step plugs into it. (No diagram — it&#x27;s a schema.)</p>
+<h3 id="3-surcharge-relay">3. Surcharge relay</h3>
+<p>PC calls QSS <code>/select</code> and translates the single FreeNow catalog into Lyft&#x27;s model. FreeNow describes a fee by <code>businessType</code>; Lyft has a distinct line-item *type* only for a few of those. The relay maps by <code>businessType</code>: a clean match becomes a <strong>native Lyft line item</strong>, everything else is carried <strong>as metadata</strong> (Lyft&#x27;s domain never learns the FreeNow concept).</p>
+<p><strong>Field mapping — FreeNow domain → Lyft domain:</strong></p>
+<table>
+<thead><tr>
+<th>FreeNow (<code>businessType</code>)</th>
+<th>Lyft line item</th>
+<th>Domain</th>
+</tr></thead><tbody>
+<tr><td><code>TOLL</code></td><td><code>TollAutomated</code></td><td>Lyft-native</td></tr>
+<tr><td><code>AIRPORT_FEE</code></td><td><code>VenueFee</code> (airport)</td><td>Lyft-native</td></tr>
+<tr><td><code>HIGH_DEMAND_FEE</code></td><td>*metadata* (would double-count PrimeTime)</td><td>metadata</td></tr>
+<tr><td><code>CITY_FEE</code>, <code>CLEAN_AIR_FEE</code>, <code>HOLIDAY_FEE</code>, <code>PREBOOK_FEE</code>, <code>SERVICE_FEE</code>, <code>BOOKING_FEE</code>, <code>ETA_BASED_FEE</code>, …</td><td>*no Lyft equivalent*</td><td>metadata</td></tr>
+</tbody></table>
+<p>Every entry — mapped or not — also carries its FreeNow-faithful fields (<code>configId</code>, <code>businessType</code>, <code>category</code>, <code>amount</code>, <code>currency</code>, <code>translationKey</code>) so TFC can rebuild its native breakdown; the <code>lyftMapping</code> annotation is set <strong>only</strong> for the two clean cases.</p>
+<div class="mermaid">
+flowchart LR
+  PC["PC surcharge node"] -->|"/select"| QSS["QSS catalog (businessType)"]
+  QSS --> MAP{"map by businessType"}
+  MAP -->|"TOLL"| T["Lyft TollAutomated"]
+  MAP -->|"AIRPORT_FEE"| V["Lyft VenueFee"]
+  MAP -->|"HIGH_DEMAND_FEE + all others"| M["metadata (FreeNow fields only)"]
+</div>
+<h3 id="4a-obtain-the-fleettype-list">4a. Obtain the fleetType list</h3>
+<p>The cross-org input for the mapping: FreeNow&#x27;s <strong>enumerated <code>fleetType</code> value list</strong> (owed by Vimal/Lucas). No dependencies, so it starts on day one — it&#x27;s the long pole that gates Step 5. Everything in 4b is quick once this list is in hand.</p>
+<h3 id="4b-fleettype-quotekey-mapping">4b. fleetType → QuoteKey mapping</h3>
+<p>PC prices per fleet type, but its engine has no concept of a FreeNow <code>fleetType</code>. Two keys do two jobs: <strong>QuoteKey <code>= (RideType, PricingKey)</code></strong> is the *input* (what PC prices), and <strong>OfferKey <code>= fleetTypeId</code></strong> is the *output label* (so TFC can match each result back). Each <code>fleetType</code> is translated into a <code>(RideType, PricingKey)</code> via the <strong>naive EU mapping</strong>; <code>PricingKey</code> is a <strong>closed IDL enum</strong>, <code>OfferKey</code> a free-form string that carries the raw <code>fleetTypeId</code>.</p>
+<div class="mermaid">
+flowchart TB
+  REQ["TFC request: price [hamburg-taxi, hamburg-taxi-xl]"]
+  REQ --> M{"naive EU mapping<br/>(closed enum)"}
+  M --> Q1["QuoteKey(eu_taxi, EU_TAXI_HAMBURG)"]
+  M --> Q2["QuoteKey(eu_taxi_xl, EU_TAXI_XL_HAMBURG)"]
+  Q1 --> G1["one graph execution → €18"]
+  Q2 --> G2["one graph execution → €25"]
+  G1 --> R1["result: offer_key=hamburg-taxi, price=€18"]
+  G2 --> R2["result: offer_key=hamburg-taxi-xl, price=€25"]
+  R1 --> TFC["TFC matches each price back by offer_key"]
+  R2 --> TFC
+</div>
+<p><strong>Where &amp; when the mapping lives.</strong> The table is <strong>PC-owned</strong>, defined in the <code>pricecomposereurope</code> Europe registration (the <code>RideType</code>/<code>PricingKey</code> values are IDL enum entries in <code>idlcode-go</code>, added per fleet-type tier). It is <strong>populated before step 5</strong> — the relay can&#x27;t run a QuoteKey that isn&#x27;t mapped — and it depends on FreeNow first handing over its <strong>enumerated <code>fleetType</code> value list</strong> (open ask to Vimal/Lucas). It is a deliberately naive, temporary table: reconciliation with Core Rider&#x27;s canonical <strong>Modes</strong> mapping is deferred to Phase 3 / UFO.</p>
+<h3 id="5-predefined-relay">5. Predefined relay</h3>
+<p>PC calls <code>PredefinedFareService</code> to fetch the fare, passing the rider&#x27;s <code>businessAccountIds</code> so a B2B account gets its own price; if none is configured, it falls back to the standard fare.</p>
+<div class="mermaid">
+flowchart TB
+  N["PC predefined node"] --> F["fetch from PredefinedFareService<br/>with businessAccountIds"]
+  F --> D{"B2B fare configured?"}
+  D -->|"yes"| B["use B2B amount"]
+  D -->|"no"| S["use standard fare (relabel)"]
+</div>
+<h3 id="6-pc-build-fuse">6. PC build (fuse)</h3>
+<p>Combine base plus surcharge into one total and emit it as line items — one result per QuoteKey. In short: <code>total = base + Σ min(base × pct/100 + fixed, ceiling)</code>. (Compact enough as text.)</p>
+<h3 id="7-tfc-read-side">7. TFC read side</h3>
+<p>TFC reads the predefined total from PC behind a provider seam, gated per office/fleet, and falls back to its existing direct calls if PC is off or errors — so nothing changes for un-gated traffic.</p>
+<div class="mermaid">
+flowchart LR
+  Q["TFC quote calc"] --> G{"gated office/fleet?"}
+  G -->|"yes"| PC["read from PriceComposer"]
+  G -->|"no / error"| FN["direct PredefinedFareService"]
+  PC --> R["PredefinedFareCalculationResult"]
+  FN --> R
+</div>
+<h3 id="8-shadow-drift-alarming">8. Shadow &amp; drift alarming</h3>
+<p>Before trusting PC, run it alongside native: compute both, compare, alarm on drift. PC&#x27;s value is never served until it matches.</p>
+<div class="mermaid">
+flowchart LR
+  REQ["quote"] --> N["native (served)"]
+  REQ --> P["PC (shadow)"]
+  N --> C{"compare"}
+  P --> C
+  C -->|"drift"| A["alarm (prc-tfc-*)"]
+  C -->|"match"| OK["parity"]
+</div>
+<h3 id="9-rollout-cutover">9. Rollout &amp; cutover</h3>
+<p>Flip PC from shadow to served one office/fleet at a time, once parity holds, keeping the fallback. Progression per market: <strong>off → shadow → served</strong>.</p>
+</body>
+</html>
