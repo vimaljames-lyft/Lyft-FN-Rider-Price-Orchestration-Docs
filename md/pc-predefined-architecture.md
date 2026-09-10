@@ -41,12 +41,10 @@ flowchart TD
     end
     PC --> DTO["Full quote: amount + surcharges + fare type"]
 
-    subgraph SHADOW["TFC shadow steps — isolated from native pricing"]
-      DTO --> BO["Map to internal BO"]
-      BO --> FAN["Fan out per payment method"]
-      FAN --> FEE["Filter platform fees per payment method"]
-      FEE --> STORE["Save to a new collection"]
-      STORE --> CMP{"Compare total, pre-discount"}
+    subgraph SHADOW["TFC shadow steps — isolated, no fan-out"]
+      DTO --> BO["Map to internal BO (per fleet type)"]
+      BO --> STORE["Save to a new collection"]
+      STORE --> CMP{"Compare pre-discount total, per fleet type"}
     end
 
     NATIVE -. "native total, pre-discount" .-> CMP
@@ -54,7 +52,7 @@ flowchart TD
     classDef served fill:#bbf7d0,stroke:#15803d,color:#111;
     classDef shadow fill:#bfdbfe,stroke:#1d4ed8,color:#111;
     class NATIVE,RESP served;
-    class PC,PFS,QSS,DTO,BO,FAN,FEE,STORE,CMP shadow;
+    class PC,PFS,QSS,DTO,BO,STORE,CMP shadow;
 ```
 
 - **Green** is what the rider gets — native TFC, unchanged.
@@ -85,7 +83,7 @@ sequenceDiagram
     PC->>QSS: get surcharges
     QSS-->>PC: surcharges
     PC-->>TFC: full quote (amount + surcharges + fare type)
-    TFC->>TFC: map to BO, fan out per payment method, filter platform fees
+    TFC->>TFC: map to BO (per fleet type, no fan-out)
     TFC->>Store: save (keyed by quoteSessionId + fleetTypeId)
     TFC->>TFC: match on quoteSessionId + fleetTypeId, compare vs captured native (pre-discount)
 ```
@@ -101,8 +99,9 @@ PC returns a **lean quote** — not a copy of TFC's internal model. Per fleet ty
 - the surcharge amount carried separately, and each surcharge marked **platform-fee** or
   **driver-fee**, so TFC can filter platform fees per payment method
 
-TFC maps this into its own (new) business object (BO), fans it out per payment method, filters platform
-fees, and stores it. TFC does **not** re-run surcharges or apply discounts on this path.
+In the shadow flow, TFC maps this into its own (new) business object (BO) and stores it per fleet type
+— no payment-method fan-out, since nothing is served. Fan-out and platform-fee filtering happen only
+when PC quotes are actually served. TFC does **not** re-run surcharges or apply discounts on this path.
 
 ## Shadow mode and rollout
 
