@@ -146,7 +146,7 @@ traffic on the shadowed offices. After cutover, PC's call replaces TFC's, so it 
 
 A new endpoint means the existing surcharge-serving path is untouched — no latency risk to today's
 callers. Nuance: a new endpoint isolates the **code path**, not the **shared backend** (datastore,
-CPU, pods). Confirm with the QSS owners whether the new endpoint runs on shared capacity.
+CPU, pods).
 
 ### When the shadow task starts, and what the "snapshot" is
 
